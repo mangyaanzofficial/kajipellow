@@ -1,0 +1,345 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================
+// ENUMS
+// =========================================================
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum TransactionStatus {
+  PENDING
+  PAID
+  PROCESSING
+  SUCCESS
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+enum TransactionType {
+  PRODUCT_ORDER
+  DEPOSIT
+}
+
+enum PaymentMethod {
+  QRIS
+  VIRTUAL_ACCOUNT
+  E_WALLET
+  BANK_TRANSFER
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+}
+
+enum WalletMutationType {
+  CREDIT // saldo bertambah (deposit sukses / refund)
+  DEBIT // saldo berkurang (bayar order pakai saldo)
+}
+
+enum NotificationType {
+  TRANSACTION_SUCCESS
+  TRANSACTION_FAILED
+  PAYMENT_RECEIVED
+  DEPOSIT_SUCCESS
+  SYSTEM
+}
+
+// =========================================================
+// USER & AUTH
+// =========================================================
+
+model User {
+  id           String     @id @default(cuid())
+  name         String
+  username     String     @unique
+  email        String     @unique
+  phone        String     @unique
+  passwordHash String
+  role         Role       @default(USER)
+  status       UserStatus @default(ACTIVE)
+
+  wallet        Wallet?
+  transactions  Transaction[]
+  deposits      Deposit[]
+  notifications Notification[]
+  sessions      Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+  @@index([username])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// =========================================================
+// WALLET (SALDO)
+// =========================================================
+
+model Wallet {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   BigInt   @default(0) // dalam rupiah, integer (hindari float untuk uang)
+  mutations WalletMutation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Ledger setiap perubahan saldo — WAJIB, untuk audit & mencegah double balance
+model WalletMutation {
+  id          String             @id @default(cuid())
+  walletId    String
+  wallet      Wallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type        WalletMutationType
+  amount      BigInt
+  balanceBefore BigInt
+  balanceAfter  BigInt
+  referenceType String // "DEPOSIT" | "TRANSACTION" | "REFUND"
+  referenceId   String // id deposit/transaction terkait
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@unique([referenceType, referenceId, type]) // cegah mutasi ganda untuk referensi yang sama
+  @@index([walletId])
+}
+
+// =========================================================
+// CATEGORY & PRODUCT
+// =========================================================
+
+model Category {
+  id       String    @id @default(cuid())
+  name     String
+  slug     String    @unique
+  icon     String? // nama icon lucide-react
+  isActive Boolean   @default(true)
+  order    Int       @default(0)
+  products Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+}
+
+model Provider {
+  id          String   @id @default(cuid())
+  name        String   @unique // ex: "ProviderA"
+  code        String   @unique // dipakai di factory adapter, ex: "provider_a"
+  isActive    Boolean  @default(true)
+  products    Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Product {
+  id             String   @id @default(cuid())
+  categoryId     String
+  category       Category @relation(fields: [categoryId], references: [id])
+  providerId     String
+  provider       Provider @relation(fields: [providerId], references: [id])
+  providerSku    String // kode SKU di sisi provider, dipakai saat createOrder()
+  name           String // ex: "86 Diamonds"
+  slug           String   @unique
+  description    String?
+  costPrice      Int // harga dari provider (rupiah)
+  sellPrice      Int // harga jual ke user (rupiah) — SUMBER KEBENARAN, jangan pernah percaya harga dari client
+  adminFee       Int      @default(0)
+  isActive       Boolean  @default(true)
+  requiresServerId Boolean @default(false) // ex: Mobile Legends butuh Server ID
+  stock          Int? // null = unlimited (digital/PPOB biasanya unlimited)
+  imageUrl       String?
+
+  transactionItems TransactionItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categoryId])
+  @@index([providerId])
+  @@index([slug])
+}
+
+// =========================================================
+// TRANSACTION
+// =========================================================
+
+model Transaction {
+  id             String            @id @default(cuid())
+  invoiceNumber  String            @unique // human-readable, ex: INV-20260905-XXXXX
+  idempotencyKey String            @unique // dikirim dari client saat create order, cegah double submit
+  userId         String?
+  user           User?             @relation(fields: [userId], references: [id])
+  type           TransactionType
+  status         TransactionStatus @default(PENDING)
+
+  targetNumber   String? // nomor HP / User ID tujuan produk
+  targetServerId String? // Server ID jika requiresServerId
+
+  subtotal   Int // total harga produk (server-side, hasil re-fetch dari DB)
+  adminFee   Int      @default(0)
+  totalAmount Int // subtotal + adminFee, ini yang dibayar
+
+  paymentId String?  @unique
+  payment   Payment? @relation(fields: [paymentId], references: [id])
+
+  items TransactionItem[]
+
+  providerOrderId       String? // id order di sisi provider setelah createOrder()
+  providerResponseRaw   Json?
+  failureReason         String?
+
+  webhookLogs WebhookLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  expiresAt DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@index([invoiceNumber])
+  @@index([createdAt])
+}
+
+model TransactionItem {
+  id            String      @id @default(cuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product     @relation(fields: [productId], references: [id])
+  productName   String // snapshot nama produk saat transaksi dibuat
+  quantity      Int         @default(1)
+  priceAtPurchase Int // snapshot harga saat itu (bukan referensi harga produk saat ini)
+
+  createdAt DateTime @default(now())
+
+  @@index([transactionId])
+}
+
+// =========================================================
+// PAYMENT
+// =========================================================
+
+model Payment {
+  id              String        @id @default(cuid())
+  gatewayName     String // ex: "mock", "midtrans"
+  gatewayRefId    String? // id transaksi di sisi payment gateway
+  method          PaymentMethod
+  status          PaymentStatus @default(PENDING)
+  amount          Int
+  qrString        String? // untuk QRIS
+  vaNumber        String? // untuk Virtual Account
+  paymentUrl      String? // redirect url jika ada
+  gatewayResponseRaw Json?
+  paidAt          DateTime?
+  expiresAt       DateTime?
+
+  transaction Transaction?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([gatewayRefId])
+}
+
+model Deposit {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id])
+  idempotencyKey String        @unique
+  amount         Int
+  paymentId      String?       @unique
+  status         PaymentStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+// =========================================================
+// WEBHOOK LOG
+// =========================================================
+
+model WebhookLog {
+  id             String       @id @default(cuid())
+  source         String // "payment" | "provider"
+  eventId        String? // id unik event dari pengirim, untuk dedup
+  transactionId  String?
+  transaction    Transaction? @relation(fields: [transactionId], references: [id])
+  signatureValid Boolean
+  payloadRaw     Json
+  processedAt    DateTime?
+  processingNote String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([source, eventId]) // cegah duplicate callback diproses dua kali
+  @@index([transactionId])
+}
+
+// =========================================================
+// NOTIFICATION
+// =========================================================
+
+model Notification {
+  id      String            @id @default(cuid())
+  userId  String
+  user    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type    NotificationType
+  title   String
+  message String
+  isRead  Boolean           @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+}
+
+// =========================================================
+// SYSTEM SETTING (key-value, dipakai admin settings)
+// =========================================================
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
